@@ -1,0 +1,9 @@
+[submodule "paper/preamble"]
+	path = paper/preamble
+	url = git@github.com:adrn/preamble.git
+[submodule ".github/instructions"]
+	path = .github/instructions
+	url = git@github.com:adrn/instructions.git
+[submodule "paper/AASTeX7"]
+	path = paper/AASTeX7
+	url = git@github.com:AASJournals/AASTeX7.git
