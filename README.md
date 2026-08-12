@@ -1,12 +1,7 @@
-# A new paper
+# harv experiments
 
-## TODO:
-
-- [ ] Initialize submodules: `git submodule init && git submodule update --recursive --remote`
-- [ ] Update project name in `pyproject.toml` and other files
-- [ ] Update copyright year in `LICENSE` file
-- [ ] Fill in this README with project-specific information
-- [ ] Enable pre-commit.ci for this repo.
+Standalone experiments for [harv](https://github.com/adrn/harv) that might help guide
+decisions and default parameters.
 
 ## License
 

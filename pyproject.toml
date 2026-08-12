@@ -1,5 +1,5 @@
 [project]
-name = "TODO"
+name = "harv-experiments"
 version = "0.1.0"
 license = { file = "LICENSE" }
 requires-python = ">=3.12"
