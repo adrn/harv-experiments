@@ -8,7 +8,8 @@ points at.
 ## State of play
 
 The harness is **built, tested, and ready to run, for both RV and Gaia epoch
-astrometry**. **No full grid has been run for either.** 41 tests pass (31 RV, 10 Gaia).
+astrometry**. **No full grid has been run for either.** 50 tests pass (31 RV, 10 Gaia,
+9 MPI/deal).
 
 Since the last handoff:
 
@@ -22,8 +23,9 @@ Since the last handoff:
   unitless and each adapter owns its own axes, units and grid geometry.
 - **The Gaia adapter exists and its identity gate passes** at four grid corners. See
   README "The Gaia adapter" for the three corrections it forced on the design.
-- Sharding is by launcher rank read from the environment, so `mpirun -n 32` works with
-  **no mpi4py dependency**. See README "Running the full grid".
+- The runner is **SPMD over mpi4py** (`mpirun`/`srun`), with work dealt
+  longest-processing-time-first and one `gather` at the end. `launch_full_grid.sh` is
+  gone; `slurm/run_grid.sh` replaces it. See README "Running the experiment".
 
 What has actually been *measured* is unchanged from the last handoff: a
 **36-simulation RV calibration slice** (`P/T_span` 0.1–1.0, `SNR` 3–30, `e` ∈ {0, 0.6},
@@ -32,9 +34,12 @@ regime map, and there is no Gaia science at all.** Do not present it as one.
 
 ## Next actions, in order
 
-1. **Run the RV grid.** `SMOKE=1` first (~1 min, exercises launch → shards → merge),
-   then `NPROC=32 bash launch_full_grid.sh scratch/kepcmp/rv_full`. ~26 min at 32
-   ranks. Commands in README "Running the full grid".
+1. **Run the RV grid.** Smoke first (~15 s: `kepcmp.run --which smoke --stride 8
+   --max-sims 8`), then `sbatch slurm/run_grid.sh`. ~14 core-hours for the signal
+   phase, so minutes across nodes — but budget **~3 h** if you run it on one 16-core
+   machine, not the ~26 min an earlier README claimed; see README "Timing" for why
+   ranks on one host do not scale linearly. Commands in README "Running the
+   experiment".
 2. **Merge shards, then run `kepcmp.reduce.regime_map`.** That is the deliverable that
    answers "which periodogram is better in which regime".
 3. **Run the Gaia grid** the same way into a *separate* directory. Never merge the two
@@ -121,10 +126,20 @@ These are the traps. Each cost real debugging time.
 - **The reference is computed on the whole grid, not a slice.** Measured at ~5 s/sim
   for RV and cheaper for Gaia (2-D MC), so the design's compute tiering is obsolete;
   `enumerate_reference_cells` and `--which reference` were deleted.
-- **No `mpi4py`.** The shards never communicate, so the rank comes from the launcher's
-  environment variables. This was not laziness for its own sake: the mpi4py wheel
-  vendors its own libmpi/libpmix, silently initialises every rank as a singleton under
-  a system `mpirun`, and then segfaults in `PMIx_Finalize`.
+- **More ranks on one host is not faster past ~cores/2.** Each rank draws ~2.4 cores
+  from XLA's CPU thread pool; `OMP_NUM_THREADS` does not control it, and
+  `--intra_op_parallelism_threads` is **not a real XLA flag** — with `--` it aborts the
+  process, without `--` it is silently skipped. Only
+  `--xla_cpu_multi_thread_eigen=false` is real. Measured throughput on 16 cores: 0.54
+  sims/s at 4 processes, 0.65 at 8, 0.64 at 16. Size `--ntasks-per-node` accordingly.
+- **`import mpi4py.MPI` runs `MPI_Init`, and on a broken MPI it HANGS rather than
+  raising.** So `kepcmp.mpi.mpi_context` imports it only when a launcher variable is
+  set (or `--mpi`). Do not "simplify" that to a plain top-level import: it cost a
+  10-minute hang on a *serial* run, and `tests/test_mpi.py` pins it.
+- **On a cluster, build mpi4py against the site MPI** (`MPICC=$(which mpicc) uv pip
+  install --no-binary mpi4py mpi4py`). The PyPI wheel vendors its own libmpi/libpmix,
+  silently initialises every rank as a singleton under a system `mpirun`, and then
+  segfaults in `PMIx_Finalize`.
 
 ## Ground rules from Adrian
 
@@ -145,8 +160,9 @@ These are the traps. Each cost real debugging time.
 | grid cells and shared knobs | `kepcmp/grid.py` |
 | runner / artifact / shard merge | `kepcmp/{run,artifact,merge}.py` |
 | the five reductions | `kepcmp/reduce/` |
-| sharded launcher (MPI or background) | `launch_full_grid.sh` |
-| tests (41) | `tests/` |
+| SPMD plumbing and the work deal | `kepcmp/mpi.py` |
+| cluster job (both phases, merge, reduce) | `slurm/run_grid.sh` |
+| tests (50) | `tests/` |
 | standalone Gaia feasibility probe | `gaia_probe.py` |
 
 ## How to run anything

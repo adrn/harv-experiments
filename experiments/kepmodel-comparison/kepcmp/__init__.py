@@ -10,7 +10,7 @@ environment where ``harv`` and ``kepmodel`` are importable::
     PYTHONPATH=$EXP uv run python -m kepcmp.identity --adapter gaia
 
 Nothing here hardcodes a location, so the directory can be copied into another
-repository as-is; ``launch_full_grid.sh`` resolves its own path. See "Porting this
+repository as-is, provided it is on ``PYTHONPATH``. See "Porting this
 code" in ``../README.md`` for what the host environment must provide.
 
 **float64 is enabled here, at import, before anything touches JAX.** harv does not

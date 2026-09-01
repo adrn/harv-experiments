@@ -8,6 +8,11 @@ dependencies = [
     "kepmodel",
 ]
 
+[project.optional-dependencies]
+mpi = [
+    "mpi4py>=4.1.2",
+]
+
 [dependency-groups]
 dev = [
   "ruff",

@@ -123,11 +123,17 @@ directory on the path rather than an installed package:
 
 ```bash
 export PYTHONPATH=experiments/kepmodel-comparison   # or wherever this directory lives
-uv run python -m pytest $PYTHONPATH/tests -q        # 41 passed
+uv run python -m pytest $PYTHONPATH/tests -q        # 50 passed
 ```
 
-`PY_CMD="python -m"` replaces the `uv run` invocation in the launcher if you are
-already inside a suitable environment.
+For a cluster run you also need `mpi4py`, which is the `mpi` extra. On a cluster,
+build it against the site MPI rather than taking the PyPI wheel — the wheel vendors
+its own `libmpi`/`libpmix`, which cannot attach to the PMIx server a system `mpirun`
+starts, and every rank then initialises as a silent singleton:
+
+```bash
+MPICC=$(which mpicc) uv pip install --no-binary mpi4py mpi4py
+```
 
 ### Step 0 — check the gate before spending any compute
 
@@ -142,59 +148,61 @@ uv run python -m kepcmp.identity --adapter gaia --n-obs 20
 Read the report, not just `PASS`. The number that diagnoses a wiring bug is the
 scale-free `identity residual ... (X relative)`: `~5e-13` is the arithmetic floor for
 RV, `~1e-7` for Gaia (higher because `cond` is genuinely larger there — see
-"The Gaia adapter"), and anything approaching O(1) is a real bug. `--period-ratio`,
-`--snr`, `--eccentricity`, `--n-obs`, `--seed` pick the cell; `--stride` thins the
-grid, since the gate is a Python loop per frequency and does not need full density.
+"The Gaia adapter"), and anything approaching O(1) is a real bug.
 
 ### Step 1 — validate the plumbing
 
-`SMOKE=1` runs 2 simulations per shard through launch → shards → merge, about a
-minute. Do this after any change to the runner, the artifact schema or an adapter.
+A few simulations on a strided grid, serially, in ~15 s. Do this after any change to
+the runner, the artifact schema or an adapter.
 
 ```bash
-EXP=experiments/kepmodel-comparison
-SMOKE=1 bash $EXP/launch_full_grid.sh scratch/kepcmp/smoketest
-SMOKE=1 ADAPTER=gaia bash $EXP/launch_full_grid.sh scratch/kepcmp/smoketest_gaia
+uv run python -m kepcmp.run --which smoke --out /tmp/smoke.h5 \
+    --stride 8 --max-sims 8 --reference-n-mc 256
+```
+
+To exercise the *parallel* path — the deal, the per-rank files and the merge — add a
+launcher and merge afterwards:
+
+```bash
+mpirun -n 4 python -m kepcmp.run --which smoke --out /tmp/smoke.h5 \
+    --stride 8 --max-sims 8 --reference-n-mc 256
+python -m kepcmp.merge --out /tmp/smoke.h5 /tmp/smoke.rank*.h5
 ```
 
 ### Step 2 — launch the grid
 
+`slurm/run_grid.sh` runs both phases, merges, and reduces, as one job:
+
 ```bash
-NPROC=32 bash $EXP/launch_full_grid.sh scratch/kepcmp/rv_full
-ADAPTER=gaia NPROC=32 bash $EXP/launch_full_grid.sh scratch/kepcmp/gaia_full
+sbatch experiments/kepmodel-comparison/slurm/run_grid.sh
+ADAPTER=gaia sbatch experiments/kepmodel-comparison/slurm/run_grid.sh
 ```
-
-Each invocation runs two phases in sequence — `signal` (the full grid, with the
-reference statistic) and `null` (`K = 0`, two configs only, for the ROC thresholds)
-— and writes per-shard artifacts plus a log per shard under `logs/`. Watch it with
-`tail -f scratch/kepcmp/rv_full/logs/*.log`.
-
-Launcher environment:
 
 | variable | default | meaning |
 |---|---|---|
 | `ADAPTER` | `rv` | `rv` or `gaia` |
-| `NPROC` | cores, capped at 32 | processes per phase |
-| `MPI` | auto (`1` if `mpirun` is on `PATH`) | `0` forces plain background processes |
-| `N_SEEDS` | 16 | signal seeds |
-| `NULL_SEEDS` | 1000 | null seeds per `n_obs`; FPR=0.01 needs >~1000 |
+| `OUT` | `$SCRATCH/kepcmp/$ADAPTER` | output directory; must be visible to every rank |
+| `REPO` | `$HOME/projects/harv-experiments` | checkout to `cd` into |
 | `REFERENCE_N_MC` | 2048 | MC draws for `R`; shape converges by ~256 |
-| `SMOKE` | unset | 2 sims per shard, plumbing only |
-| `PY_CMD` | `uv run python -m` | replace the invocation |
+| `NULL_SEEDS` | 1000 | null seeds per `n_obs`; FPR=0.01 needs >~1000 |
 
-### Step 3 — merge the shards
+Node and rank counts are `#SBATCH` directives at the top of the script. Off a cluster,
+`mpirun -n N python -m kepcmp.run ...` directly is the same thing.
+
+### Step 3 — merge and reduce
+
+The job script already does this; run it by hand for a partial or re-done grid. Merge
+is serial and cheap — one process, no `mpirun`:
 
 ```bash
-OUT=scratch/kepcmp/rv_full
+OUT=$SCRATCH/kepcmp/rv
 uv run python -m kepcmp.merge --out $OUT/signal.h5 $OUT/signal.rank*.h5
 uv run python -m kepcmp.merge --out $OUT/null.h5   $OUT/null.rank*.h5
 ```
 
 `merge` refuses on a frequency-grid mismatch or a duplicate `sim_id`, both of which
-mean the shards were not from one run. At `NPROC=1` there are no `.rank` files — the
-single shard writes `signal.h5` directly and this step is unnecessary.
-
-### Step 4 — reduce
+mean the shards were not from one run. At one rank there are no `.rank` files — the
+single process writes `signal.h5` directly and this step is unnecessary.
 
 `regime_map` is the deliverable; the other four answer the design document's four
 questions individually. All take `--csv` to write a table alongside the printed
@@ -213,7 +221,7 @@ uv run python -m kepcmp.reduce.regime_map --artifact $OUT/signal.h5 \
 | `reduce.calibrate` | which `sigma_amp` makes `Delta` reproduce `R` | `--artifact` (needs `R`) |
 | `reduce.prior_quality` | which makes a better interim period prior | `--artifact` |
 
-`prior_quality` is the expensive one and is deliberately **not** in the launcher: it
+`prior_quality` is the expensive one and is deliberately **not** in the job script: it
 runs a rejection sampler per simulation per arm. Start with `--limit` and raise
 `--n-prior-samples` well above the default before believing the result — at 50k
 every arm was under-resolved. `regime_map` and `roc` take `--fpr`; everything that
@@ -223,71 +231,103 @@ match across arms for the comparison to mean anything.
 ### What lands on disk
 
 ```
-scratch/kepcmp/rv_full/
-  logs/signal.log, logs/null.log          # or logs/<phase>.rank<i>.log without MPI
-  signal.rank000.h5 ... signal.rankNNN.h5 # one per shard, written incrementally
+$OUT/
+  signal.rank000.h5 ... signal.rankNNN.h5   # one per rank, written incrementally
   null.rank000.h5   ... null.rankNNN.h5
-  signal.h5, null.h5                      # after merge
-  regime_map.csv                          # after reduce
+  signal.h5, null.h5                        # after merge
+  regime_map.csv                            # after reduce
+slurm/logs/kepcmp-<jobid>.o                 # rank 0 narrates; other ranks every 50th
 ```
 
 Artifacts are written **incrementally**, one simulation at a time, so a run that dies
 partway through still leaves a readable file with everything finished so far. There is
-no resume: re-running a shard rewrites its file from scratch.
+no resume: re-running a rank rewrites its file from scratch. A simulation that raises
+is counted and logged rather than killing the rank, and the run exits non-zero if any
+failed.
 
 ### Parallelism
 
-The grid is embarrassingly parallel and the shards never talk to each other: each
-writes its own `<name>.rank<NNN>.h5` and `kepcmp.merge` combines them afterwards. So
-`kepcmp.run` reads its rank from the *launcher's environment*
-(`OMPI_COMM_WORLD_RANK`, `PMI_RANK`, `PMIX_RANK`, `SLURM_PROCID`) rather than linking
-`libmpi`. `mpirun -n 32 python -m kepcmp.run ...` therefore works with no `mpi4py`
-dependency at all, and a broken or ABI-mismatched MPI runtime cannot take a run down
-at `MPI_Init`. `--shard i --n-shards N` is the explicit equivalent, and
-`launch_full_grid.sh` uses `mpirun` when it is on `PATH` and plain background
-processes otherwise (`MPI=0` forces the latter).
+`kepcmp.run` is SPMD. Every rank runs the same code, asks `COMM_WORLD` which rank it
+is, takes its own share of the simulation list, and writes its own
+`<name>.rank<NNN>.h5`. Ranks never communicate during the work and no two write the
+same file, so nothing needs MPI-IO or parallel HDF5; there is one `gather` at the end,
+purely so rank 0 can print a summary. MPI is a launcher, not a message bus. The ranks
+do need a shared filesystem for `OUT`, because the merge reads all of their files.
 
-The shard identity is printed at startup, so an unrecognised launcher shows up
-immediately as `1 shard (serial)` instead of every rank silently overwriting one file.
-**Check that line in the log before walking away from a long run.**
+**Work is dealt longest-processing-time-first**, not by a contiguous slice or a stride.
+Per-simulation cost is close to linear in `n_obs`, and the grid is enumerated with
+`n_obs` varying *fastest*, so a stride whose length shares a factor with the `n_obs`
+ladder is pathological: at 5 ranks on the RV grid (5 `n_obs` values) one rank would
+draw every `n_obs = 32` cell and another every `n_obs = 2` cell. LPT cannot fall into
+that hole, and `tests/test_mpi.py` pins both the partition property and the comparison
+against a stride.
 
-Jobs are dealt **round-robin** across shards, not in contiguous blocks: per-simulation
-cost grows with `n_obs`, so a contiguous split would hand every expensive cell to the
-same rank and leave the others idle at the end.
+**mpi4py is imported only when a launcher variable is present** (`OMPI_COMM_WORLD_SIZE`,
+`PMI_SIZE`, `PMIX_RANK`, `MV2_COMM_WORLD_SIZE`, `SLURM_PROCID`), or when `--mpi` forces
+it. This is not fastidiousness: `import mpi4py.MPI` runs `MPI_Init` as a side effect,
+and on a host whose MPI is broken or ABI-mismatched it does not raise — it *hangs*.
+Importing unconditionally makes a plain laptop run, and the test suite, hostage to an
+MPI installation the serial path has no use for.
 
-Each process is pinned to one thread. The matrices are tiny (`n_obs <= 80`,
-`k <= 17`), so they do not parallelize within a process and N single-threaded shards
-beat N shards fighting over BLAS threads.
+**Threads.** Set `OMP_NUM_THREADS=1` and
+`XLA_FLAGS=--xla_cpu_multi_thread_eigen=false`; the job script does both, and rank 0's
+banner warns when they are missing. Note that XLA's CPU thread pool does *not* honour
+`OMP_NUM_THREADS` and takes ~2.4 cores per rank by default — and that the
+frequently-copied companion flag `intra_op_parallelism_threads=1` is **not a real XLA
+flag**. Spelled with `--` it aborts the process (`Unknown flag in XLA_FLAGS`); spelled
+without, it is silently skipped and does nothing at all. Size `--ntasks-per-node`
+against measurement, not against the core count.
 
 ### Timing
 
-Measured on a 16-core laptop over the full 1828-point grid, 15 harv configs plus
-kepmodel plus the reference at `n_mc = 2048`: RV runs 5.5 s/sim at `n_obs = 2` rising
-to 8.7 s/sim at `n_obs = 32`, mean 7.0. So 7200 signal sims is ~14 h serial and
-~26 min at 32 ranks; the nulls (two configs only) are ~50 min serial. Gaia has not
-been timed at full density; its 5760 sims are in the same class, with the reference
-*cheaper* (2-D MC) and the per-frequency algebra dearer (9 columns instead of 3).
+**Measure aggregate throughput, not per-simulation time, and do not extrapolate the
+two.** An earlier version of this section quoted 7.0 s/sim solo and divided by the
+process count, predicting ~26 min for the RV grid at 32 ranks. That is wrong by
+roughly 4x, because ranks on one machine do not scale linearly — each draws more than
+one core from XLA.
+
+Measured on a 16-core M-series laptop, RV, full 1828-point grid, 15 harv configs plus
+kepmodel plus the reference at `n_mc = 2048`, holding total work fixed at 32
+simulations:
+
+| processes | wall | throughput | per-process s/sim |
+|---|---|---|---|
+| 1 | — | 0.23 sims/s | 4.4 |
+| 4 | 59 s | 0.54 sims/s | ~7 |
+| 8 | 49 s | **0.65 sims/s** | ~12 |
+| 16 | 50 s | 0.64 sims/s | ~19 |
+
+Throughput saturates by 8 processes on 16 cores; 16 buys **nothing** while making each
+one 4x slower. A rank reporting 19 s/sim is therefore not necessarily unhealthy — the
+number to read is rank 0's `balance` line, and `peak RSS` x ranks-per-node has to fit
+in a node.
+
+At the saturated single-machine rate the 7200-simulation RV signal grid is ~3 h on that
+laptop, i.e. ~14 core-hours; across nodes it is minutes. Gaia per-simulation cost
+measured ~1.4x RV on a smaller grid (914 points vs 1828): the reference is *cheaper*
+(2-D MC) but the per-frequency algebra is dearer (9 columns against 3).
 
 ### Running one cell by hand
 
-`kepcmp.run` takes the same flags the launcher passes, so a single cell or a fast
-partial grid is one command. `--stride` thins the frequency grid and `--limit` caps
-the simulations per shard — together they turn a 14-hour grid into a 30-second check.
+`kepcmp.run` is the same entry point the job script calls, so a single cell or a fast
+partial grid is one command. `--stride` thins the frequency grid and `--max-sims` caps
+the whole job list — together they turn a 3-hour grid into a 30-second check.
 
 ```bash
 uv run python -m kepcmp.run --adapter gaia --which smoke --out /tmp/probe.h5 \
-    --stride 16 --n-terms 1 --sigma-amp-mults 1.0 --reference-n-mc 256 --limit 3
+    --stride 16 --n-terms 1 --sigma-amp-mults 1.0 --reference-n-mc 256 --max-sims 3
 ```
 
 | flag | meaning |
 |---|---|
 | `--which` | `signal`, `null`, or `smoke` (a few cells spanning the adapter's grid) |
 | `--stride` | subsample the shared frequency grid |
-| `--limit` | stop after N simulations **per shard** |
+| `--max-sims` | use only the first N simulations, applied **before** the deal so every rank agrees |
 | `--n-terms`, `--sigma-amp-mults` | cut the config sweep down from 15 |
 | `--reference-n-mc` | `0` disables `R`, which is most of the per-sim cost |
 | `--n-seeds`, `--seed-offset` | which seeds to run |
-| `--shard`, `--n-shards` | explicit sharding, overriding rank detection |
+| `--mpi` | force mpi4py when the launcher's variables are not recognised |
+| `--progress-every` | progress cadence on non-zero ranks (default 50) |
 
 `gaia_probe.py` next to this file is a standalone 60-line version of the same path
 (simulate → harv periodogram → kepmodel `AstroModel`) with no `kepcmp` machinery,
@@ -333,8 +373,9 @@ Modules:
 | `reduce/{decompose,roc,prior_quality,calibrate}.py` | the four reductions |
 | `reduce/regime_map.py` | per-regime verdict on all three metrics side by side |
 | `reduce/common.py` | the only thing reductions share |
-| `merge.py` | combine seed-sharded artifacts into one |
-| `launch_full_grid.sh` | sharded launcher (MPI or background processes); `SMOKE=1` validates plumbing first |
+| `merge.py` | combine per-rank artifacts into one |
+| `mpi.py` | SPMD plumbing: rank context, the longest-first deal, the end-of-run gather |
+| `slurm/run_grid.sh` | the cluster job: both phases, merge, reduce |
 
 Each reduction reads the artifact and shares nothing else with the others.
 
@@ -692,8 +733,8 @@ Implemented in `kepcmp/`; **41 tests pass** (31 RV, 10 Gaia). See
 
 ### Porting this code
 
-The directory is self-contained: copy it anywhere and `launch_full_grid.sh` resolves
-its own path. The host environment must provide:
+The directory is self-contained: copy it anywhere and put it on `PYTHONPATH`. The
+host environment must provide:
 
 - **`harv` and `kepmodel` importable**, plus `h5py`, `numpy`, `jax`, `numpyro`,
   `equinox`, `unxt` (all already harv dependencies). In this repo both are git
