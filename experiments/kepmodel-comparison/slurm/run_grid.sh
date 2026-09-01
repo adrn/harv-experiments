@@ -1,9 +1,9 @@
 #!/bin/zsh -l
 #SBATCH -J kepcmp
-#SBATCH -o slurm/logs/kepcmp-%j.o
-#SBATCH -e slurm/logs/kepcmp-%j.e
-#SBATCH -N 4
-#SBATCH --ntasks-per-node=32
+#SBATCH -o slurm/logs/kepcmp.o
+#SBATCH -e slurm/logs/kepcmp.e
+#SBATCH -N 6
+# --ntasks-per-node=32
 #SBATCH --exclusive
 #SBATCH -t 4:00:00
 #SBATCH -p cca
@@ -28,8 +28,10 @@
 
 set -euo pipefail
 
-cd "${REPO:-$HOME/projects/harv-experiments}"
+cd "${$HOME/work/harv-experiments}"
+REPO="${$HOME/work/harv-experiments}"
 source .venv/bin/activate
+echo $REPO
 
 EXP="experiments/kepmodel-comparison"
 export PYTHONPATH="$EXP"
@@ -40,7 +42,7 @@ if [[ -z "${OUT:-}" && -z "${SCRATCH:-}" ]]; then
   echo "error: set OUT (or SCRATCH) to a directory every rank can see" >&2
   exit 1
 fi
-OUT="${OUT:-$SCRATCH/kepcmp/$ADAPTER}"
+OUT="${$EXP/output/$ADAPTER}"
 REFERENCE_N_MC="${REFERENCE_N_MC:-2048}"
 NULL_SEEDS="${NULL_SEEDS:-1000}"
 mkdir -p "$OUT"
