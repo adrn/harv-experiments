@@ -33,7 +33,16 @@ cd "$REPO"
 source .venv/bin/activate
 
 EXP="experiments/kepmodel-comparison"
-export PYTHONPATH="$EXP"
+# PREPEND, never assign. mpi4py is the site build (a nix-store view on PYTHONPATH,
+# not a venv package), which is what we want -- it is compiled against the same MPI
+# this job's `mpirun` comes from, unlike a PyPI wheel, which vendors its own libmpi
+# and would silently initialise every rank as a singleton. Overwriting PYTHONPATH
+# here therefore removes mpi4py from every rank, and the job dies one traceback per
+# rank in `mpi_context`. Absolute path so it survives any rank whose cwd differs.
+export PYTHONPATH="$REPO/$EXP${PYTHONPATH:+:$PYTHONPATH}"
+
+# Fail in one second, not after mpirun has started several hundred ranks.
+python -c "import mpi4py; print(f'mpi4py {mpi4py.__version__} from {mpi4py.__file__}')"
 
 ADAPTER="${ADAPTER:-rv}"
 # Absolute, so the merge globs and every rank agree regardless of cwd. The checkout is
