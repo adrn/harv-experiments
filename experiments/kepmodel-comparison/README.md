@@ -173,9 +173,11 @@ python -m kepcmp.merge --out /tmp/smoke.h5 /tmp/smoke.rank*.h5
 
 `slurm/run_grid.sh` runs both phases, merges, and reduces, as one job:
 
+Run from experiments/kepmodel-comparison/.
+
 ```bash
-sbatch experiments/kepmodel-comparison/slurm/run_grid.sh
-ADAPTER=gaia sbatch experiments/kepmodel-comparison/slurm/run_grid.sh
+sbatch slurm/run_grid.sh
+ADAPTER=gaia sbatch slurm/run_grid.sh
 ```
 
 | variable | default | meaning |
