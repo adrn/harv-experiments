@@ -59,7 +59,7 @@ export JAX_PLATFORMS=cpu
 export XLA_FLAGS="--xla_cpu_multi_thread_eigen=false"
 
 date
-echo "adapter=$ADAPTER  out=$OUT  ranks=$SLURM_NTASKS"
+echo "adapter=$ADAPTER  out=$OUT"
 
 mpirun python -m kepcmp.run \
     --adapter "$ADAPTER" --which signal --out "$OUT/signal.h5" \
