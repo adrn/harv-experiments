@@ -28,21 +28,20 @@
 
 set -euo pipefail
 
-cd "${$HOME/work/harv-experiments}"
-REPO="${$HOME/work/harv-experiments}"
+REPO="${REPO:-$HOME/work/harv-experiments}"
+cd "$REPO"
 source .venv/bin/activate
-echo $REPO
 
 EXP="experiments/kepmodel-comparison"
 export PYTHONPATH="$EXP"
 
 ADAPTER="${ADAPTER:-rv}"
-# Fail loudly rather than writing to /kepcmp/rv if neither is set.
-if [[ -z "${OUT:-}" && -z "${SCRATCH:-}" ]]; then
-  echo "error: set OUT (or SCRATCH) to a directory every rank can see" >&2
-  exit 1
-fi
-OUT="${$EXP/output/$ADAPTER}"
+# Absolute, so the merge globs and every rank agree regardless of cwd. The checkout is
+# already on a filesystem every rank can see -- they import kepcmp from it -- so this
+# needs no configuration; set OUT to point somewhere roomier if you'd rather.
+# Sizing: ~1.0 MB/simulation for RV and ~0.5 MB for Gaia at full grid density, so the
+# signal phase is ~7 GB (RV) or ~3 GB (Gaia).
+OUT="${OUT:-$REPO/$EXP/output/$ADAPTER}"
 REFERENCE_N_MC="${REFERENCE_N_MC:-2048}"
 NULL_SEEDS="${NULL_SEEDS:-1000}"
 mkdir -p "$OUT"
