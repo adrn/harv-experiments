@@ -85,4 +85,12 @@ python -m kepcmp.merge --out "$OUT/null.h5"   "$OUT"/null.rank*.h5
 python -m kepcmp.reduce.regime_map \
     --artifact "$OUT/signal.h5" --null-artifact "$OUT/null.h5" \
     --csv "$OUT/regime_map.csv"
+
+# The report bundle: the thing harv actually ingests. Runs the remaining reductions,
+# writes REPORT.md / findings.json / tables / figures. Minutes, single process.
+python -m kepcmp.report --adapter "$ADAPTER" --artifact-dir "$OUT" \
+    --out "$REPO/$EXP/report/$ADAPTER"
+
+# Once BOTH adapters have run, cross them and emit the two harv-facing documents:
+#   python -m kepcmp.report.synthesis report/rv report/gaia --out report/
 date

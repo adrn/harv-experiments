@@ -11,3 +11,7 @@ wheels/
 
 # This project
 data
+
+# Grid artifacts: ~7 GB for the RV signal phase alone. The report/ bundle beside them
+# is small and committable on purpose.
+experiments/*/output/

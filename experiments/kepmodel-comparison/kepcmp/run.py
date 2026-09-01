@@ -218,8 +218,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="0 disables the reference statistic")
     parser.add_argument(
         "--max-sims", type=int, default=None,
-        help="use only the first N simulations of the whole grid (smoke tests). "
-             "Applied before the deal, so every rank agrees on the same short list",
+        help="use only N simulations, spread evenly across the whole grid "
+             "(smoke tests). Applied before the deal, so every rank agrees",
     )
     parser.add_argument(
         "--mpi", action="store_true",
@@ -252,9 +252,23 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     all_jobs = [(c, s) for c in cells for s in seeds(n_seeds, offset=args.seed_offset)]
-    if args.max_sims:
-        # Truncate before the deal, so every rank agrees on the same short list.
-        all_jobs = all_jobs[: args.max_sims]
+    if args.max_sims and args.max_sims < len(all_jobs):
+        # A fixed-seed sample without replacement, not the first N and not a stride.
+        #
+        # Truncation returns one corner of the grid: cells come from
+        # itertools.product, so the first N all share the smallest period_ratio. But a
+        # *stride* is no better, because the stride length aliases against the axis
+        # lengths -- at 90 of 1350 jobs the step is 15, an exact multiple of the
+        # 5-value n_obs ladder, so every sampled cell lands on the same n_obs and a
+        # "grid-spanning" sample silently covers one rung. (The same aliasing is why
+        # kepcmp.mpi.balance deals longest-first rather than by stride.)
+        #
+        # Sub-sampled before the deal, so every rank agrees on the same short list.
+        rng = np.random.default_rng(0)
+        keep = np.sort(
+            rng.choice(len(all_jobs), size=args.max_sims, replace=False)
+        )
+        all_jobs = [all_jobs[i] for i in keep]
     jobs = balance(all_jobs, [_estimate_cost(c) for c, _ in all_jobs], rank, size)
 
     if rank == 0:

@@ -55,11 +55,22 @@ from kepcmp.reduce.common import (
     tv_distance,
 )
 
-#: ``P / T_span`` at or above which the period is not localizable from the data.
-IDENTIFIABILITY_LIMIT = 3.0
+#: Minimum separation from zero frequency, in periodogram peak widths, for the period
+#: to count as localizable. One peak width is ``1 / T_span``, and the injected
+#: frequency is ``1 / (period_ratio * T_span)``, so a cell sits ``1 / period_ratio``
+#: peak widths from zero and the criterion is adapter-independent.
+#:
+#: ``1/3`` reproduces the RV grid's previous hardcoded ``period_ratio >= 3`` cut while
+#: applying correctly to any grid. It matters: the old constant silently flagged
+#: nothing on the Gaia grid, whose widest cell (``period_ratio = 2``) sits 0.5 peak
+#: widths out --- *better* localized than the RV cells the constant did flag.
+MIN_PEAK_WIDTHS_FROM_ZERO = 1.0 / 3.0
 
 #: ``|ln P|`` tolerance counted as recovering the injected period.
 RECOVERY_LN_TOL = 0.1
+
+#: Arm names, in report order.
+ARMS = ("delta_default", "delta_h1", "z0")
 
 
 def _thresholds(
@@ -178,7 +189,8 @@ def reduce_regime_map(
 
     rows: list[dict] = []
     for _cell_id, slot in sorted(per_cell.items()):
-        identifiable = slot["period_ratio"] < IDENTIFIABILITY_LIMIT
+        peak_widths = 1.0 / slot["period_ratio"] if slot["period_ratio"] else np.inf
+        identifiable = peak_widths >= MIN_PEAK_WIDTHS_FROM_ZERO
         for arm in arms:
             rec = slot["per_arm"].get(arm)
             base = {
@@ -205,6 +217,7 @@ def reduce_regime_map(
                         "recovered": np.nan,
                         "tpr": np.nan,
                         "period_identifiable": identifiable,
+                        "peak_widths_from_zero": peak_widths,
                         "n_null": null_counts.get(slot["n_obs"], 0),
                     }
                 )
@@ -228,6 +241,7 @@ def reduce_regime_map(
                     ),
                     "tpr": float(np.mean(rec["det"])) if rec["det"] else np.nan,
                     "period_identifiable": identifiable,
+                    "peak_widths_from_zero": peak_widths,
                     "n_null": null_counts.get(slot["n_obs"], 0),
                 }
             )
@@ -236,18 +250,46 @@ def reduce_regime_map(
     return rows
 
 
-def _verdict(rows: list[dict], metric: str, *, lower_is_better: bool) -> dict:
-    """Per-cell winner among available arms on one metric."""
+def _verdict(
+    rows: list[dict], metric: str, *, lower_is_better: bool, rtol: float = 1e-12
+) -> dict:
+    """Per-cell winner among available arms, with ties reported *as* ties.
+
+    Ties are not a technicality here. harv's overfitting cap forces ``n_terms=1``
+    below a threshold, which makes ``delta_default`` **bit-identical** to
+    ``delta_h1`` in 270/450 RV cells and 180/360 Gaia cells. An earlier version of
+    this function took ``min``/``max`` over an insertion-ordered list, so every one
+    of those ties was silently awarded to whichever arm came first --- inflating its
+    headline win count by more than half the grid. Anything built on those numbers
+    was measuring dict ordering.
+
+    Returns the tally (ties keyed by their tied members), the number of cells scored,
+    and how many produced a decisive winner.
+    """
     by_cell: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
         if r["available"] and np.isfinite(r[metric]):
             by_cell[r["cell_id"]].append(r)
+
     tally: dict[str, int] = defaultdict(int)
+    n_decisive = 0
     for cell_rows in by_cell.values():
-        pick = (min if lower_is_better else max)(cell_rows, key=lambda r: r[metric])
-        tally[pick["arm"]] += 1
-    tally["_cells"] = len(by_cell)
-    return dict(tally)
+        vals = np.asarray([r[metric] for r in cell_rows], dtype=float)
+        best = vals.min() if lower_is_better else vals.max()
+        winners = sorted(
+            cell_rows[i]["arm"]
+            for i in np.flatnonzero(np.isclose(vals, best, rtol=rtol, atol=0.0))
+        )
+        if len(winners) == 1:
+            tally[winners[0]] += 1
+            n_decisive += 1
+        else:
+            tally["tie(" + "+".join(winners) + ")"] += 1
+    return {
+        "tally": dict(tally),
+        "n_cells": len(by_cell),
+        "n_decisive": n_decisive,
+    }
 
 
 def _summarize(rows: list[dict]) -> str:
@@ -274,22 +316,60 @@ def _summarize(rows: list[dict]) -> str:
         if not sub:
             lines.append(f"\n{metric}: not computed (missing reference or nulls)")
             continue
-        lines.append(f"\n{metric} (per-cell winner; {'lower' if lower else 'higher'} better):")
+        lines.append(
+            f"\n{metric} (per-cell winner; {'lower' if lower else 'higher'} better):"
+        )
         v = _verdict(rows, metric, lower_is_better=lower)
-        cells = v.pop("_cells")
-        for arm, n in sorted(v.items(), key=lambda kv: -kv[1]):
-            lines.append(f"  {arm:<16} wins {n:>4}/{cells}")
-        lines.append("  medians by arm:")
-        for arm in ("delta_default", "delta_h1", "z0"):
-            vals = [r[metric] for r in sub if r["arm"] == arm]
-            if vals:
-                lines.append(f"    {arm:<16} {np.median(vals):.4f}  (n={len(vals)})")
+        cells, decisive = v["n_cells"], v["n_decisive"]
+        for arm, n in sorted(v["tally"].items(), key=lambda kv: -kv[1]):
+            verb = "ties" if arm.startswith("tie(") else "wins"
+            lines.append(f"  {arm:<34} {verb} {n:>4}/{cells}")
+        lines.append(
+            f"  decisive in {decisive}/{cells} cells"
+            + (
+                "  (the rest are exact ties -- usually the overfitting cap making"
+                " delta_default identical to delta_h1)"
+                if decisive < cells
+                else ""
+            )
+        )
+
+        # Two median blocks. The first is over whatever each arm has, which is what
+        # an earlier version reported alone -- and it is not a comparison, because z0
+        # is absent wherever n_obs <= p + d and the delta arms are not. The second
+        # restricts to cells every arm reached, which is the like-for-like number.
+        common = {
+            cid
+            for cid in {r["cell_id"] for r in rows}
+            if all(
+                any(
+                    r["cell_id"] == cid and r["arm"] == arm and np.isfinite(r[metric])
+                    for r in rows
+                )
+                for arm in ARMS
+            )
+        }
+        for label, keep in (
+            ("all cells each arm reached", None),
+            (f"cells all arms reached (n={len(common)})", common),
+        ):
+            lines.append(f"  medians by arm, {label}:")
+            for arm in ARMS:
+                vals = [
+                    r[metric]
+                    for r in sub
+                    if r["arm"] == arm and (keep is None or r["cell_id"] in keep)
+                ]
+                if vals:
+                    lines.append(
+                        f"    {arm:<16} {np.median(vals):.4f}  (n={len(vals)})"
+                    )
 
     # Sparse-data slice, which is the regime that motivated this axis.
     lines.append("\nsparse-data slice (median tv by n_obs):")
     for n_obs in sorted({r["n_obs"] for r in rows}):
         parts = []
-        for arm in ("delta_default", "delta_h1", "z0"):
+        for arm in ARMS:
             vals = [
                 r["tv"] for r in rows
                 if r["n_obs"] == n_obs and r["arm"] == arm and np.isfinite(r["tv"])
