@@ -1,7 +1,7 @@
 #!/bin/zsh -l
 #SBATCH -J ampcal
-#SBATCH -o slurm/logs/ampcal.o
-#SBATCH -e slurm/logs/ampcal.e
+#SBATCH -o slurm/logs/ampcal-%j.o
+#SBATCH -e slurm/logs/ampcal-%j.e
 #SBATCH -N 6
 # --ntasks-per-node=32
 #SBATCH --exclusive
