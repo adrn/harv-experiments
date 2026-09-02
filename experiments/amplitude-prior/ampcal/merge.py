@@ -28,7 +28,9 @@ from __future__ import annotations
 __all__ = ("ShardReport", "inspect_shards", "main", "merge")
 
 import argparse
+import contextlib
 import datetime as dt
+import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -36,6 +38,10 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+
+SPACE_HEADROOM = 1.1
+"""Free space required, as a multiple of the shards' total size. The merged file is
+about the same size as its inputs; the 10% covers HDF5's own metadata overhead."""
 
 RETRY_ATTEMPTS = 4
 RETRY_DELAY_S = 5.0
@@ -72,6 +78,36 @@ def _with_retry[T](fn: Callable[[], T], *, attempts: int, delay: float) -> T:
                 raise
             time.sleep(delay * attempt)
     raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _require_space(inputs: list[Path], output: Path) -> None:
+    """Fail in one second if the destination cannot hold a second copy of the grid.
+
+    The merge writes a full copy of every shard into one file, so it needs as much free
+    space again as the shards occupy -- and the shards are normally sitting on the same
+    filesystem, so the run has already spent half the budget. Running out partway does
+    not fail cleanly: HDF5 write failures corrupt the output's object headers, every
+    subsequent lookup in it fails with ``message not aligned``, and the merge reports
+    that as *every shard* being unreadable. That is a spectacularly misleading symptom
+    for a full disk, and it costs a completed multi-core-hour run.
+
+    ``shutil.disk_usage`` reports the filesystem, not the caller's quota, so this catches
+    a genuinely full device and not a quota that is exhausted while the device has room.
+    A quota failure lands in the copy loop's guard instead, which now says to check space
+    first.
+    """
+    need = sum(p.stat().st_size for p in inputs)
+    free = shutil.disk_usage(output.parent if output.parent.exists() else Path.cwd()).free
+    if free < need * SPACE_HEADROOM:
+        raise ValueError(
+            f"not enough room to merge: {len(inputs)} shards total "
+            f"{need / 1e9:.1f} GB and {output.parent} has {free / 1e9:.1f} GB free "
+            f"(want {need * SPACE_HEADROOM / 1e9:.1f} GB, including headroom).\n"
+            "Point --out at a filesystem with room -- the reductions take a path, so "
+            "the merged artifact does not have to live beside the shards. Pass "
+            "--no-space-check to override (a quota, not the device, is the usual reason "
+            "this check is wrong in either direction)."
+        )
 
 
 def _mtime(stat: object) -> str:
@@ -114,8 +150,8 @@ class ShardReport:
 def inspect_shards(
     inputs: list[Path],
     *,
-    attempts: int = RETRY_ATTEMPTS,
-    delay: float = RETRY_DELAY_S,
+    attempts: int | None = None,
+    delay: float | None = None,
 ) -> list[ShardReport]:
     """Open every shard and report what it holds, without writing anything.
 
@@ -135,6 +171,12 @@ def inspect_shards(
     out to be transient: every one of the 576 shards read perfectly minutes later. Pass
     ``attempts=1`` to inspect without waiting, which is what a post-mortem wants.
     """
+    # Resolved here rather than bound as defaults: a default argument is evaluated once
+    # at import, so `RETRY_ATTEMPTS` would document a policy this function had already
+    # frozen and could no longer be changed at runtime.
+    attempts = RETRY_ATTEMPTS if attempts is None else attempts
+    delay = RETRY_DELAY_S if delay is None else delay
+
     out: list[ShardReport] = []
     for path in inputs:
         stat = path.stat()
@@ -187,8 +229,9 @@ def merge(
     output: Path,
     *,
     allow_partial: bool = False,
-    attempts: int = RETRY_ATTEMPTS,
-    delay: float = RETRY_DELAY_S,
+    check_space: bool = True,
+    attempts: int | None = None,
+    delay: float | None = None,
 ) -> tuple[int, int, list[ShardReport]]:
     """Copy every simulation from ``inputs`` into ``output``.
 
@@ -212,6 +255,8 @@ def merge(
     usable = [r.path for r in reports if r.ok]
     if not usable:
         raise ValueError("no readable shards; nothing to merge")
+    if check_space:
+        _require_space(usable, output)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     n_sims = 0
@@ -225,6 +270,7 @@ def merge(
                 # Inspection walks the link names; copying additionally reads every
                 # dataset block, so a shard with an unwritten *data* block passes the
                 # check and fails here. Guarded for the same reason the check exists.
+                from_this_shard: list[str] = []
                 try:
                     with h5py.File(path, "r") as src:
                         grid = np.asarray(src["frequency"])
@@ -250,12 +296,19 @@ def merge(
                                     "re-merge."
                                 )
                             src.copy(src[f"sims/{sim_id}"], out["sims"], name=sim_id)
-                            n_sims += 1
+                            from_this_shard.append(sim_id)
                 except ValueError:
                     # A grid mismatch or a duplicate id is a wiring error, not a broken
                     # file: --allow-partial must not paper over it.
                     raise
                 except Exception as exc:  # their I/O; the file is bad
+                    # A shard reported as skipped must contribute *nothing*. Leaving the
+                    # sims it copied before failing produces an artifact holding half a
+                    # shard while claiming the shard was dropped -- which is precisely
+                    # the silently-missing-cells failure --allow-partial exists to avoid.
+                    for sim_id in from_this_shard:
+                        with contextlib.suppress(Exception):
+                            del out["sims"][sim_id]
                     stat = path.stat()
                     failed.append(
                         ShardReport(
@@ -275,6 +328,19 @@ def merge(
                         ) from exc
                 else:
                     merged.append(path)
+                    n_sims += len(from_this_shard)
+            if not merged:
+                # Every shard failed during the copy. That is not a partial merge, it is
+                # a failed one, and --allow-partial must not turn it into a zero-content
+                # artifact and an exit status of 0.
+                raise ValueError(
+                    f"all {len(usable)} shards failed while copying; nothing merged.\n"
+                    + "\n".join(r.line() for r in failed[:5])
+                    + (f"\n  ... and {len(failed) - 5} more" if len(failed) > 5 else "")
+                    + "\n\nAn identical error on every shard is a problem with the "
+                    "destination, not the shards -- check free space on "
+                    f"{output.parent} first."
+                )
             out.attrs["merged_from"] = [str(p) for p in merged]
             out.attrs["n_shards"] = len(merged)
             # Recorded in the artifact, not just printed: a partial merge that only ever
@@ -296,6 +362,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="output artifact; required unless --check")
     parser.add_argument("--check", action="store_true",
                         help="inspect the shards and report; write nothing")
+    parser.add_argument("--no-space-check", action="store_true",
+                        help="skip the free-space preflight")
     parser.add_argument("--allow-partial", action="store_true",
                         help="merge the readable shards even if some are unreadable; "
                              "the count of dropped shards is recorded in the artifact")
@@ -313,15 +381,23 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--out is required unless --check is given")
 
     n_sims, n_shards, skipped = merge(
-        args.inputs, args.out, allow_partial=args.allow_partial
+        args.inputs,
+        args.out,
+        allow_partial=args.allow_partial,
+        check_space=not args.no_space_check,
     )
     print(f"merged {n_sims:,} simulations from {n_shards} shards -> {args.out}")
     if skipped:
         print(f"SKIPPED {len(skipped)} unreadable shard(s):")
-        for r in skipped:
+        for r in skipped[:20]:
             print(r.line())
+        if len(skipped) > 20:
+            print(f"  ... and {len(skipped) - 20} more")
         print("The artifact records this in its `n_shards_skipped` attribute.")
-    return 0
+    # Non-zero even under --allow-partial: the caller asked to continue past bad shards,
+    # not to be told the run was complete. run_grid.sh is `set -e`, and a merge that
+    # dropped shards must not silently flow into the reductions.
+    return 1 if skipped else 0
 
 
 if __name__ == "__main__":

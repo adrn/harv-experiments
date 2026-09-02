@@ -215,3 +215,110 @@ def test_a_permanently_bad_shard_still_gives_up(tmp_path: Path) -> None:
     _truncate(p)
     report = m.inspect_shards([p], attempts=3, delay=0.0)[0]
     assert not report.ok and report.error
+
+
+def test_a_failed_shard_leaves_nothing_behind(shards: list[Path], tmp_path: Path) -> None:
+    """A shard reported as skipped must contribute *zero* sims, not the ones it managed.
+
+    Observed: a full disk made every shard fail partway, and the merge reported
+    "merged 4,032 simulations from 0 shards" -- an artifact holding half of every shard
+    while recording that no shard was merged. A reduction cannot tell that from a
+    complete grid.
+    """
+    import ampcal.merge as m
+
+    real_copy = h5py.File.copy
+    calls = {"n": 0}
+
+    def flaky(self, source, dest, name=None, **kw):
+        calls["n"] += 1
+        # Fail on the 2nd sim of the 1st shard: one sim is already copied by then.
+        if calls["n"] == 2:
+            raise OSError("message not aligned")
+        return real_copy(self, source, dest, name=name, **kw)
+
+    h5py.File.copy = flaky
+    try:
+        n_sims, n_shards, skipped = m.merge(
+            shards, tmp_path / "signal.h5", allow_partial=True, **NO_WAIT
+        )
+    finally:
+        h5py.File.copy = real_copy
+
+    assert len(skipped) == 1 and n_shards == 3
+    # The headline invariant: the count must equal what the merged shards actually hold.
+    assert n_sims == 9
+    with h5py.File(tmp_path / "signal.h5", "r") as h:
+        assert len(h["sims"]) == n_sims
+        assert h.attrs["n_shards"] == n_shards
+        # Nothing from the failed shard survived.
+        assert not any(sid.startswith("cell_r0_") for sid in h["sims"])
+
+
+def test_every_shard_failing_is_a_failure_not_a_partial_merge(
+    shards: list[Path], tmp_path: Path
+) -> None:
+    """An identical error on all N shards is a problem with the destination, and
+    --allow-partial must not turn it into a zero-content artifact and exit 0."""
+    import ampcal.merge as m
+
+    real_copy = h5py.File.copy
+
+    def always_fails(self, source, dest, name=None, **kw):
+        raise OSError("message not aligned")
+
+    h5py.File.copy = always_fails
+    try:
+        with pytest.raises(ValueError, match="all 4 shards failed while copying"):
+            m.merge(shards, tmp_path / "signal.h5", allow_partial=True, **NO_WAIT)
+    finally:
+        h5py.File.copy = real_copy
+    assert not (tmp_path / "signal.h5").exists()
+
+
+def test_skipping_shards_exits_non_zero(
+    shards: list[Path], tmp_path: Path, monkeypatch
+) -> None:
+    """`run_grid.sh` is `set -e`. A merge that dropped shards must not flow silently
+    into the reductions just because --allow-partial was passed."""
+    import ampcal.merge as m
+
+    # main() owns the retry policy, so the constant is what a test can reach.
+    monkeypatch.setattr(m, "RETRY_DELAY_S", 0.0)
+    _truncate(shards[1])
+    rc = m.main([
+        "--out", str(tmp_path / "signal.h5"), "--allow-partial", "--no-space-check",
+        *[str(p) for p in shards],
+    ])
+    assert rc == 1
+    rc_clean = m.main([
+        "--out", str(tmp_path / "clean.h5"), "--no-space-check",
+        *[str(p) for p in shards if p != shards[1]],
+    ])
+    assert rc_clean == 0
+
+
+def test_space_preflight_refuses_before_writing(
+    shards: list[Path], tmp_path: Path, monkeypatch
+) -> None:
+    """Fail in one second, not after 6 GB. Running out mid-merge corrupts the output's
+    object headers and reports every shard as unreadable -- a spectacularly misleading
+    symptom for a full disk."""
+    import types
+
+    import ampcal.merge as m
+
+    # `_require_space` reads only `.free`; a stand-in avoids depending on shutil private
+    # API for the shape of its result.
+    monkeypatch.setattr(
+        m.shutil, "disk_usage", lambda p: types.SimpleNamespace(free=1024)
+    )
+    with pytest.raises(ValueError, match="not enough room to merge"):
+        m.merge(shards, tmp_path / "signal.h5", **NO_WAIT)
+    assert not (tmp_path / "signal.h5").exists()
+
+    # And the override exists, because the check reads the device and not a quota.
+    n_sims, _, _ = m.merge(
+        shards, tmp_path / "signal.h5", check_space=False, **NO_WAIT
+    )
+    assert n_sims == 12
