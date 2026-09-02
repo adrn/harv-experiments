@@ -16,6 +16,9 @@ import numpy as np
 import pytest
 from ampcal.merge import inspect_shards, merge
 
+# The suite must never sit through the production backoff.
+NO_WAIT = {"attempts": 1}
+
 NF = 32
 
 
@@ -52,7 +55,7 @@ def shards(tmp_path: Path) -> list[Path]:
 
 
 def test_merges_clean_shards(shards: list[Path], tmp_path: Path) -> None:
-    n_sims, n_shards, skipped = merge(shards, tmp_path / "signal.h5")
+    n_sims, n_shards, skipped = merge(shards, tmp_path / "signal.h5", **NO_WAIT)
     assert (n_sims, n_shards, skipped) == (12, 4, [])
     with h5py.File(tmp_path / "signal.h5", "r") as h:
         assert len(h["sims"]) == 12
@@ -65,7 +68,7 @@ def test_a_truncated_shard_is_named_not_a_traceback(
     """The whole point: the error has to say *which* file, out of 576."""
     _truncate(shards[2])
     with pytest.raises(ValueError, match=r"1 of 4 shards could not be read") as exc:
-        merge(shards, tmp_path / "signal.h5")
+        merge(shards, tmp_path / "signal.h5", **NO_WAIT)
     assert shards[2].name in str(exc.value)
     # And it must not have left a half-written artifact behind that a reduction would
     # happily read as a complete grid.
@@ -77,7 +80,7 @@ def test_allow_partial_merges_the_rest_and_records_it(
 ) -> None:
     _truncate(shards[2])
     n_sims, n_shards, skipped = merge(
-        shards, tmp_path / "signal.h5", allow_partial=True
+        shards, tmp_path / "signal.h5", allow_partial=True, **NO_WAIT
     )
     assert (n_sims, n_shards) == (9, 3)
     assert [r.path for r in skipped] == [shards[2]]
@@ -92,7 +95,7 @@ def test_inspect_reports_size_and_mtime_for_every_shard(shards: list[Path]) -> N
     """``mtime`` is the discriminator between this run's shards and an earlier run's
     orphans, and the two need opposite responses (re-run vs. delete and re-merge)."""
     _truncate(shards[1])
-    reports = inspect_shards(shards)
+    reports = inspect_shards(shards, **NO_WAIT)
     assert len(reports) == 4
     assert [r.ok for r in reports] == [True, False, True, True]
     assert all(r.bytes > 0 and r.mtime for r in reports)
@@ -107,7 +110,7 @@ def test_all_shards_unreadable_is_not_an_empty_success(
     for p in shards:
         _truncate(p)
     with pytest.raises(ValueError, match="no readable shards"):
-        merge(shards, tmp_path / "signal.h5", allow_partial=True)
+        merge(shards, tmp_path / "signal.h5", allow_partial=True, **NO_WAIT)
 
 
 def test_duplicate_sim_id_points_at_stale_shards(tmp_path: Path) -> None:
@@ -116,7 +119,7 @@ def test_duplicate_sim_id_points_at_stale_shards(tmp_path: Path) -> None:
     a = _shard(tmp_path / "signal.rank000.h5", ["cell_seed000"])
     b = _shard(tmp_path / "signal.rank001.h5", ["cell_seed000"])
     with pytest.raises(ValueError, match="orphaned rank files"):
-        merge([a, b], tmp_path / "signal.h5")
+        merge([a, b], tmp_path / "signal.h5", **NO_WAIT)
 
 
 def test_a_shard_that_fails_mid_copy_is_caught(shards: list[Path], tmp_path: Path) -> None:
@@ -138,12 +141,12 @@ def test_a_shard_that_fails_mid_copy_is_caught(shards: list[Path], tmp_path: Pat
     h5py.File.copy = flaky
     try:
         with pytest.raises(ValueError, match="failed while copying"):
-            m.merge(shards, tmp_path / "signal.h5")
+            m.merge(shards, tmp_path / "signal.h5", **NO_WAIT)
         assert not (tmp_path / "signal.h5").exists()
 
         calls["n"] = 0
         n_sims, n_shards, skipped = m.merge(
-            shards, tmp_path / "signal.h5", allow_partial=True
+            shards, tmp_path / "signal.h5", allow_partial=True, **NO_WAIT
         )
         assert len(skipped) == 1 and "failed while copying" in skipped[0].error
         assert n_shards == 3 and n_sims < 12
@@ -166,7 +169,7 @@ def test_check_iterates_links_rather_than_counting(tmp_path: Path) -> None:
 
     h5py.Group.__iter__ = watching_iter
     try:
-        report = m.inspect_shards([p])[0]
+        report = m.inspect_shards([p], **NO_WAIT)[0]
     finally:
         h5py.Group.__iter__ = real_iter
     assert report.ok and report.n_sims == 2
@@ -174,3 +177,41 @@ def test_check_iterates_links_rather_than_counting(tmp_path: Path) -> None:
     # that the links were actually walked -- that is the operation that failed on the
     # cluster, and a check that skips it is not a check.
     assert "/sims" in iterated, "inspect_shards never iterated the links"
+
+
+def test_a_transient_read_is_retried(tmp_path: Path) -> None:
+    """The failure this was built for: intact on the servers, unreadable right now.
+
+    576 ranks closed ~10 GB seconds before the merge read it, one shard came back with an
+    unreadable link heap, and the same file read perfectly minutes later. Giving up on
+    the first attempt discards a completed 60 core-hour run.
+    """
+    import ampcal.merge as m
+
+    p = _shard(tmp_path / "signal.rank000.h5", ["a_seed000", "b_seed001"])
+    calls = {"n": 0}
+    real_open = h5py.File.__init__
+
+    def flaky(self, name, mode="r", **kw):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise OSError("unable to offset into local heap data block")
+        return real_open(self, name, mode, **kw)
+
+    h5py.File.__init__ = flaky
+    try:
+        report = m.inspect_shards([p], attempts=4, delay=0.0)[0]
+    finally:
+        h5py.File.__init__ = real_open
+    assert report.ok and report.n_sims == 2
+    assert calls["n"] == 3, "retried the wrong number of times"
+
+
+def test_a_permanently_bad_shard_still_gives_up(tmp_path: Path) -> None:
+    """Retry must not turn a genuinely corrupt shard into a hang or a false pass."""
+    import ampcal.merge as m
+
+    p = _shard(tmp_path / "signal.rank000.h5", ["a_seed000"])
+    _truncate(p)
+    report = m.inspect_shards([p], attempts=3, delay=0.0)[0]
+    assert not report.ok and report.error

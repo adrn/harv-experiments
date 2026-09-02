@@ -29,11 +29,49 @@ __all__ = ("ShardReport", "inspect_shards", "main", "merge")
 
 import argparse
 import datetime as dt
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import h5py
 import numpy as np
+
+RETRY_ATTEMPTS = 4
+RETRY_DELAY_S = 5.0
+"""Backoff between attempts, multiplied by the attempt number: 5s, 10s, 15s.
+
+Measured against the failure this exists for: 576 ranks across six nodes closed ~10 GB
+seconds before the merge started reading it, one shard came back with an unreadable link
+heap, and the same file read perfectly a few minutes later. Thirty seconds of patience
+against a 60 core-hour run is not a trade worth thinking about.
+"""
+
+
+def _with_retry[T](fn: Callable[[], T], *, attempts: int, delay: float) -> T:
+    """Run ``fn``, retrying I/O failures with linear backoff.
+
+    The merge reads several hundred files that *other nodes* closed seconds earlier. On
+    a network filesystem the reading client can still hold a stale, partial view of one
+    of them --- close-to-open consistency covers the data a client wrote, not the
+    attribute cache of a client that never had the file open. So a shard can be
+    genuinely intact on the servers and unreadable here, which is a transient, and a
+    transient that discards a completed run is a bug rather than bad luck.
+
+    This deliberately retries *everything*, not a curated list of exceptions: HDF5
+    surfaces this class of problem as ``OSError``, ``RuntimeError`` and ``KeyError``
+    depending on which block was missed, and guessing the set wrong reintroduces exactly
+    the failure being fixed. A genuinely corrupt shard costs the full backoff and is then
+    reported normally.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception:  # see docstring: the exception type varies
+            if attempt == attempts:
+                raise
+            time.sleep(delay * attempt)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _mtime(stat: object) -> str:
@@ -73,7 +111,12 @@ class ShardReport:
         )
 
 
-def inspect_shards(inputs: list[Path]) -> list[ShardReport]:
+def inspect_shards(
+    inputs: list[Path],
+    *,
+    attempts: int = RETRY_ATTEMPTS,
+    delay: float = RETRY_DELAY_S,
+) -> list[ShardReport]:
     """Open every shard and report what it holds, without writing anything.
 
     ``mtime`` is reported because it is the discriminator between the two failure
@@ -83,18 +126,26 @@ def inspect_shards(inputs: list[Path]) -> list[ShardReport]:
 
     The link names are **iterated**, not counted. ``len(group)`` reads the group's
     stored object count and need not touch the link heap, so a file whose heap block is
-    unwritten passes a length check and then fails in the merge's own
+    unreadable passes a length check and then fails in the merge's own
     ``for sim_id in src["sims"]`` -- which is precisely the observed failure
     (``unable to offset into local heap data block``). The check has to perform the same
     operation the merge does or it is not a check.
+
+    Each shard is retried (see :func:`_with_retry`) because that observed failure turned
+    out to be transient: every one of the 576 shards read perfectly minutes later. Pass
+    ``attempts=1`` to inspect without waiting, which is what a post-mortem wants.
     """
     out: list[ShardReport] = []
     for path in inputs:
         stat = path.stat()
         mtime = _mtime(stat)
+
+        def read(p: Path = path) -> int:
+            with h5py.File(p, "r") as src:
+                return len(list(src["sims"]))
+
         try:
-            with h5py.File(path, "r") as src:
-                n = len(list(src["sims"]))
+            n = _with_retry(read, attempts=attempts, delay=delay)
         except Exception as exc:  # noqa: BLE001  (their I/O; any failure is the file's)
             out.append(
                 ShardReport(
@@ -132,7 +183,12 @@ def _summarize(reports: list[ShardReport]) -> str:
 
 
 def merge(
-    inputs: list[Path], output: Path, *, allow_partial: bool = False
+    inputs: list[Path],
+    output: Path,
+    *,
+    allow_partial: bool = False,
+    attempts: int = RETRY_ATTEMPTS,
+    delay: float = RETRY_DELAY_S,
 ) -> tuple[int, int, list[ShardReport]]:
     """Copy every simulation from ``inputs`` into ``output``.
 
@@ -143,7 +199,7 @@ def merge(
     if not inputs:
         raise ValueError("no input artifacts given")
 
-    reports = inspect_shards(inputs)
+    reports = inspect_shards(inputs, attempts=attempts, delay=delay)
     bad = [r for r in reports if not r.ok]
     if bad and not allow_partial:
         raise ValueError(
@@ -247,7 +303,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.check:
-        reports = inspect_shards(args.inputs)
+        # One attempt: --check is a post-mortem, and its job is to report what is true
+        # right now rather than to wait out a transient the way the merge should.
+        reports = inspect_shards(args.inputs, attempts=1)
         print(_summarize(reports))
         return 1 if any(not r.ok for r in reports) else 0
 
