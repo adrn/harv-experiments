@@ -128,15 +128,35 @@ else
     # and trusts what it finds, so a previous run at a different rank count leaves orphans
     # the glob picks up. Scoped to $ADAPTER: the shard names carry the adapter precisely
     # so two adapters sharing an OUT cannot collide, and a blanket rm would undo that.
-    rm -f "$OUT"/signal."$ADAPTER".rank*.h5
+    #
+    # `(N)` is zsh's NULL_GLOB qualifier and it is mandatory here. In zsh an unmatched
+    # glob is a FATAL error -- the pattern never reaches `rm`, it aborts the script, and
+    # `set -e` kills the job. So the first run into a clean directory died on the line
+    # meant to clean it. (`zsh -n` cannot catch this; it is runtime glob behaviour.)
+    # Applied per pattern rather than by `setopt null_glob`, because the merge glob below
+    # must keep failing when it matches nothing.
+    stale=( "$OUT"/signal."$ADAPTER".rank*.h5(N) )
+    if (( ${#stale} > 0 )); then
+        echo "clearing ${#stale} shard(s) from an earlier run"
+        rm -f -- "${stale[@]}"
+    fi
 
     mpirun python -m ampcal.run \
         --adapter "$ADAPTER" --which signal --out "$OUT/signal.h5" \
         --reference-n-mc "$REFERENCE_N_MC"
+
+    # Checked explicitly rather than left to the glob: "no matches found" from zsh names
+    # a pattern, not a problem. This says what actually went wrong.
+    shards=( "$OUT"/signal."$ADAPTER".rank*.h5(N) )
+    if (( ${#shards} == 0 )); then
+        echo "no shards in $OUT -- the run wrote nothing to merge" >&2
+        exit 1
+    fi
     # Merge is serial and cheap -- one process, no mpirun. It names any shard it cannot
     # read rather than dying on an opaque h5py traceback; `--allow-partial` is the
     # deliberate override, never the default.
-    python -m ampcal.merge --out "$OUT/signal.h5" "$OUT"/signal."$ADAPTER".rank*.h5
+    echo "merging ${#shards} shard(s)"
+    python -m ampcal.merge --out "$OUT/signal.h5" "${shards[@]}"
 fi
 
 python -m ampcal.reduce.calibrate \
