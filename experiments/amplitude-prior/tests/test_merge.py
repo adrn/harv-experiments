@@ -1,0 +1,176 @@
+"""Merging must survive one bad shard out of hundreds, and say which one.
+
+The merge is the last step of a job that has already spent tens of core-hours across
+several hundred ranks. A shard can come back short (a filesystem writeback that failed
+after ``close()`` succeeded) or stale (an orphan of an earlier run at a different rank
+count, which the ``signal.rank*.h5`` glob picks up regardless). Losing the whole run to
+an ``h5py`` traceback that names no file is the failure this module exists to prevent.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import h5py
+import numpy as np
+import pytest
+from ampcal.merge import inspect_shards, merge
+
+NF = 32
+
+
+def _shard(path: Path, sim_ids: list[str]) -> Path:
+    with h5py.File(path, "w") as h:
+        h.create_dataset("frequency", data=np.linspace(0.001, 0.1, NF))
+        h.attrs["adapter"] = "rv"
+        sims = h.create_group("sims")
+        for sid in sim_ids:
+            g = sims.create_group(sid)
+            g.attrs["seed"] = 0
+            g.create_dataset("x", data=np.zeros(NF))
+    return path
+
+
+def _truncate(path: Path, keep: float = 0.4) -> None:
+    """Chop the tail off a real HDF5 file.
+
+    This is the actual observed failure -- the superblock and the early datasets survive,
+    so the file opens and ``/frequency`` reads fine, and only iterating ``/sims`` hits a
+    heap offset past the end. A zero-byte or garbage file would not exercise that path.
+    """
+    size = path.stat().st_size
+    with path.open("r+b") as fh:
+        fh.truncate(int(size * keep))
+
+
+@pytest.fixture
+def shards(tmp_path: Path) -> list[Path]:
+    return [
+        _shard(tmp_path / f"signal.rank{r:03d}.h5", [f"cell_r{r}_seed{i:03d}" for i in range(3)])
+        for r in range(4)
+    ]
+
+
+def test_merges_clean_shards(shards: list[Path], tmp_path: Path) -> None:
+    n_sims, n_shards, skipped = merge(shards, tmp_path / "signal.h5")
+    assert (n_sims, n_shards, skipped) == (12, 4, [])
+    with h5py.File(tmp_path / "signal.h5", "r") as h:
+        assert len(h["sims"]) == 12
+        assert h.attrs["n_shards_skipped"] == 0
+
+
+def test_a_truncated_shard_is_named_not_a_traceback(
+    shards: list[Path], tmp_path: Path
+) -> None:
+    """The whole point: the error has to say *which* file, out of 576."""
+    _truncate(shards[2])
+    with pytest.raises(ValueError, match=r"1 of 4 shards could not be read") as exc:
+        merge(shards, tmp_path / "signal.h5")
+    assert shards[2].name in str(exc.value)
+    # And it must not have left a half-written artifact behind that a reduction would
+    # happily read as a complete grid.
+    assert not (tmp_path / "signal.h5").exists()
+
+
+def test_allow_partial_merges_the_rest_and_records_it(
+    shards: list[Path], tmp_path: Path
+) -> None:
+    _truncate(shards[2])
+    n_sims, n_shards, skipped = merge(
+        shards, tmp_path / "signal.h5", allow_partial=True
+    )
+    assert (n_sims, n_shards) == (9, 3)
+    assert [r.path for r in skipped] == [shards[2]]
+    with h5py.File(tmp_path / "signal.h5", "r") as h:
+        # Recorded in the file, not only on stdout: a partial merge that only said so in
+        # a log produces an artifact no reduction can tell from a complete one.
+        assert h.attrs["n_shards_skipped"] == 1
+        assert shards[2].name in h.attrs["shards_skipped"][0]
+
+
+def test_inspect_reports_size_and_mtime_for_every_shard(shards: list[Path]) -> None:
+    """``mtime`` is the discriminator between this run's shards and an earlier run's
+    orphans, and the two need opposite responses (re-run vs. delete and re-merge)."""
+    _truncate(shards[1])
+    reports = inspect_shards(shards)
+    assert len(reports) == 4
+    assert [r.ok for r in reports] == [True, False, True, True]
+    assert all(r.bytes > 0 and r.mtime for r in reports)
+    assert reports[1].n_sims is None
+    assert reports[1].error
+    assert reports[0].n_sims == 3
+
+
+def test_all_shards_unreadable_is_not_an_empty_success(
+    shards: list[Path], tmp_path: Path
+) -> None:
+    for p in shards:
+        _truncate(p)
+    with pytest.raises(ValueError, match="no readable shards"):
+        merge(shards, tmp_path / "signal.h5", allow_partial=True)
+
+
+def test_duplicate_sim_id_points_at_stale_shards(tmp_path: Path) -> None:
+    """Two shards holding the same sim_id means an orphan got into the glob, which is
+    the other half of the same hazard -- so the message has to say so."""
+    a = _shard(tmp_path / "signal.rank000.h5", ["cell_seed000"])
+    b = _shard(tmp_path / "signal.rank001.h5", ["cell_seed000"])
+    with pytest.raises(ValueError, match="orphaned rank files"):
+        merge([a, b], tmp_path / "signal.h5")
+
+
+def test_a_shard_that_fails_mid_copy_is_caught(shards: list[Path], tmp_path: Path) -> None:
+    """Inspection walks link names; copying also reads dataset blocks. A shard whose
+    data blocks are unwritten passes the check and dies in the copy loop, so that loop
+    needs the same guard -- and must still not leave a half-written artifact.
+    """
+    import ampcal.merge as m
+
+    real_copy = h5py.File.copy
+    calls = {"n": 0}
+
+    def flaky(self, source, dest, name=None, **kw):
+        calls["n"] += 1
+        if calls["n"] == 5:
+            raise OSError("unable to read data block")
+        return real_copy(self, source, dest, name=name, **kw)
+
+    h5py.File.copy = flaky
+    try:
+        with pytest.raises(ValueError, match="failed while copying"):
+            m.merge(shards, tmp_path / "signal.h5")
+        assert not (tmp_path / "signal.h5").exists()
+
+        calls["n"] = 0
+        n_sims, n_shards, skipped = m.merge(
+            shards, tmp_path / "signal.h5", allow_partial=True
+        )
+        assert len(skipped) == 1 and "failed while copying" in skipped[0].error
+        assert n_shards == 3 and n_sims < 12
+    finally:
+        h5py.File.copy = real_copy
+
+
+def test_check_iterates_links_rather_than_counting(tmp_path: Path) -> None:
+    """`len(group)` can read a stored count without touching the link heap, which is
+    exactly the block that was unreadable. The check must do what the merge does."""
+    import ampcal.merge as m
+
+    p = _shard(tmp_path / "signal.rank000.h5", ["a_seed000", "b_seed001"])
+    iterated: list[str] = []
+    real_iter = h5py.Group.__iter__
+
+    def watching_iter(self):
+        iterated.append(self.name)
+        return real_iter(self)
+
+    h5py.Group.__iter__ = watching_iter
+    try:
+        report = m.inspect_shards([p])[0]
+    finally:
+        h5py.Group.__iter__ = real_iter
+    assert report.ok and report.n_sims == 2
+    # `list()` also calls __len__ as a size hint, which is harmless. What matters is
+    # that the links were actually walked -- that is the operation that failed on the
+    # cluster, and a check that skips it is not a check.
+    assert "/sims" in iterated, "inspect_shards never iterated the links"

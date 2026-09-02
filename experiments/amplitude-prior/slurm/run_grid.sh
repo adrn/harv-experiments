@@ -85,10 +85,19 @@ if [[ "$SMOKE" == "1" ]]; then
     python -m ampcal.run --adapter "$ADAPTER" --which smoke --out "$OUT/signal.h5" \
         --stride 16 --n-seeds 2 --reference-n-mc 256
 else
+    # Clear shards from any earlier run BEFORE launching. The merge globs
+    # `signal.rank*.h5` and trusts what it finds, so a previous run at a different rank
+    # count leaves orphans the glob happily picks up -- and an orphan of a killed run is
+    # exactly the kind of file that is truncated. This run is about to overwrite the
+    # ones it owns anyway; the only files this deletes are ones nothing else will.
+    rm -f "$OUT"/signal.rank*.h5
+
     mpirun python -m ampcal.run \
         --adapter "$ADAPTER" --which signal --out "$OUT/signal.h5" \
         --reference-n-mc "$REFERENCE_N_MC"
-    # Merge is serial and cheap -- one process, no mpirun.
+    # Merge is serial and cheap -- one process, no mpirun. It names any shard it cannot
+    # read rather than dying on an opaque h5py traceback; `--allow-partial` is the
+    # deliberate override, never the default.
     python -m ampcal.merge --out "$OUT/signal.h5" "$OUT"/signal.rank*.h5
 fi
 

@@ -152,17 +152,17 @@ Everything runs with this directory on `PYTHONPATH`:
 EXP=experiments/amplitude-prior
 
 # 1. the correctness gate, on a period-dependent arm. Non-negotiable and cheap.
-PYTHONPATH=$EXP uv run python -m ampcal.identity --adapter rv --n-obs 40
-PYTHONPATH=$EXP uv run python -m ampcal.identity --adapter gaia --n-obs 40
+uv run python -m ampcal.identity --adapter rv --n-obs 40
+uv run python -m ampcal.identity --adapter gaia --n-obs 40
 
 # 2. a laptop-sized end-to-end pass
-PYTHONPATH=$EXP uv run python -m ampcal.run --adapter rv --which smoke \
-    --out /tmp/rv/signal.h5 --stride 16 --n-seeds 2 --reference-n-mc 256
-PYTHONPATH=$EXP uv run python -m ampcal.reduce.calibrate --artifact /tmp/rv/signal.h5
+uv run python -m ampcal.run --adapter rv --which smoke \
+  --out /tmp/rv/signal.h5 --stride 16 --n-seeds 2 --reference-n-mc 256
+uv run python -m ampcal.reduce.calibrate --artifact /tmp/rv/signal.h5
 
 # 3. the real thing
-sbatch $EXP/slurm/run_grid.sh
-ADAPTER=gaia sbatch $EXP/slurm/run_grid.sh
+sbatch slurm/run_grid.sh
+ADAPTER=gaia sbatch slurm/run_grid.sh
 python -m ampcal.report.synthesis report/rv report/gaia --out report/
 ```
 
