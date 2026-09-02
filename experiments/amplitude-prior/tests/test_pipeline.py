@@ -164,3 +164,22 @@ def test_report_bundle(artifact: Path, tmp_path: Path) -> None:
     )
     assert out.exists()
     assert (tmp_path / "bundle" / "findings.json").exists()
+
+
+def test_shard_paths_are_adapter_scoped() -> None:
+    """Two adapters must not write the same shard file.
+
+    They did: a stray `OUT` in the job's environment (the launcher ran `zsh -l`, so it
+    sourced dotfiles, and sbatch exports the submitting environment) beat the script's
+    own per-adapter default. Both grids ran at 576 ranks and both wrote
+    `signal.rank000.h5`. The directory split is fixed in `run_grid.sh`; this is the
+    second line of defence.
+    """
+    from ampcal.run import _rank_path
+
+    out = Path("/tmp/out/signal.h5")
+    assert _rank_path(out, "rv", 0, 576).name == "signal.rv.rank000.h5"
+    assert _rank_path(out, "gaia", 0, 576).name == "signal.gaia.rank000.h5"
+    assert _rank_path(out, "rv", 0, 576) != _rank_path(out, "gaia", 0, 576)
+    # A single rank still writes the plain path, which the smoke run and this suite use.
+    assert _rank_path(out, "rv", 0, 1) == out

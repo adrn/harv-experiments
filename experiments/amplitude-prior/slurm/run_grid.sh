@@ -12,12 +12,23 @@
 # One grid, as a single job.
 #
 #   sbatch experiments/amplitude-prior/slurm/run_grid.sh
-#   ADAPTER=gaia sbatch experiments/amplitude-prior/slurm/run_grid.sh
+#   AMPCAL_ADAPTER=gaia sbatch experiments/amplitude-prior/slurm/run_grid.sh
+#
+# Knobs, all AMPCAL_-prefixed (see the note by `set -euo pipefail` for why):
+#   AMPCAL_ADAPTER        rv | gaia            (default rv)
+#   AMPCAL_OUT_ROOT       artifacts go to $AMPCAL_OUT_ROOT/$ADAPTER
+#   AMPCAL_SMOKE          1 to run the tiny end-to-end pass
+#   AMPCAL_REFERENCE_N_MC reference MC draws   (default 2048)
+#   AMPCAL_REPO           checkout to cd into
 #
 # `ampcal.run` is SPMD: each rank takes its own share of the simulation list and writes
-# its own `<name>.rank<NNN>.h5`. Ranks never communicate during the work, so this needs
-# no MPI-IO and no parallel HDF5 -- but it does need the ranks to share a filesystem for
-# OUT, because the merge at the end reads all of them.
+# its own `<name>.<adapter>.rank<NNN>.h5`. Ranks never communicate during the work, so
+# this needs no MPI-IO and no parallel HDF5 -- but it does need the ranks to share a
+# filesystem for OUT, because the merge at the end reads all of them.
+#
+# The adapter is in the shard filename as well as the directory. Belt and braces: the
+# directory split is now unoverridable (see AMPCAL_OUT_ROOT), and even if two runs did
+# somehow share a directory they would no longer write the same files.
 #
 # Sizing. RV is 420 cells x 16 seeds = 6,720 simulations; Gaia is 336 x 16 = 5,376.
 # Measured on the predecessor harness: ~0.65 sims/s saturating at 8 processes per node
@@ -27,13 +38,34 @@
 # up: `balance` below ~85% means the deal is the limit rather than the compute, and
 # `peak RSS` x ntasks-per-node has to fit in a node.
 #
-# SMOKE=1 runs the whole chain on a handful of cells first. Do that before the real
+# AMPCAL_SMOKE=1 runs the whole chain on a handful of cells first. Do that before the real
 # launch; it costs a minute and it is the only thing that exercises launch -> shards ->
 # merge -> reduce -> report end to end.
 
 set -euo pipefail
 
-REPO="${REPO:-$HOME/work/harv-experiments}"
+# Every knob is AMPCAL_-prefixed, and that prefix is load-bearing.
+#
+# This runs under `zsh -l`, a LOGIN shell, so each job sources ~/.zshenv, ~/.zprofile
+# and ~/.zshrc; `sbatch` also defaults to --export=ALL, so the submitting environment
+# arrives too. An earlier version read plain `OUT`, `REPO`, `ADAPTER`, `SMOKE`. Those
+# are not defaults, they are fallbacks that any same-named variable anywhere in that
+# environment silently wins -- and it did: `OUT` was already set to `output/rv`, which
+# does not depend on $ADAPTER, so the RV and Gaia grids were both sent to the same
+# directory. Same rank count, same `signal.rank000.h5`, one grid written over the other.
+#
+# Names nothing else plausibly uses, plus the provenance echo below, plus deriving OUT
+# rather than accepting it whole (see AMPCAL_OUT_ROOT).
+for _v in AMPCAL_REPO AMPCAL_ADAPTER AMPCAL_OUT_ROOT AMPCAL_SMOKE AMPCAL_REFERENCE_N_MC
+do
+    if [[ -n "${(P)_v:-}" ]]; then
+        echo "config: $_v=${(P)_v}  <- INHERITED from the environment"
+    else
+        echo "config: $_v  <- unset, using the script default"
+    fi
+done
+
+REPO="${AMPCAL_REPO:-$HOME/work/harv-experiments}"
 cd "$REPO"
 source .venv/bin/activate
 
@@ -49,15 +81,22 @@ export PYTHONPATH="$REPO/$EXP${PYTHONPATH:+:$PYTHONPATH}"
 # Fail in one second, not after mpirun has started several hundred ranks.
 python -c "import mpi4py; print(f'mpi4py {mpi4py.__version__} from {mpi4py.__file__}')"
 
-ADAPTER="${ADAPTER:-rv}"
-SMOKE="${SMOKE:-0}"
+ADAPTER="${AMPCAL_ADAPTER:-rv}"
+SMOKE="${AMPCAL_SMOKE:-0}"
+REFERENCE_N_MC="${AMPCAL_REFERENCE_N_MC:-2048}"
+
+# OUT is DERIVED, never accepted whole: the adapter subdirectory is always appended, so
+# no environment can put two grids in one directory even by accident. Override the root
+# to move the artifacts somewhere roomier; you cannot override away the per-adapter
+# split, which is the thing that broke.
+#
 # Absolute, so the merge globs and every rank agree regardless of cwd. The checkout is
 # already on a filesystem every rank can see -- they import ampcal from it -- so this
-# needs no configuration; set OUT to point somewhere roomier if you'd rather.
+# needs no configuration.
 # Sizing: ~1.5 MB/simulation for RV and ~0.8 MB for Gaia at full grid density with 24
 # arms, so the grid is ~10 GB (RV) or ~4 GB (Gaia).
-OUT="${OUT:-$REPO/$EXP/output/$ADAPTER}"
-REFERENCE_N_MC="${REFERENCE_N_MC:-2048}"
+OUT_ROOT="${AMPCAL_OUT_ROOT:-$REPO/$EXP/output}"
+OUT="$OUT_ROOT/$ADAPTER"
 mkdir -p "$OUT"
 
 # One BLAS thread per rank: the design matrices are ~80 x 17, so BLAS threads buy
@@ -85,12 +124,11 @@ if [[ "$SMOKE" == "1" ]]; then
     python -m ampcal.run --adapter "$ADAPTER" --which smoke --out "$OUT/signal.h5" \
         --stride 16 --n-seeds 2 --reference-n-mc 256
 else
-    # Clear shards from any earlier run BEFORE launching. The merge globs
-    # `signal.rank*.h5` and trusts what it finds, so a previous run at a different rank
-    # count leaves orphans the glob happily picks up -- and an orphan of a killed run is
-    # exactly the kind of file that is truncated. This run is about to overwrite the
-    # ones it owns anyway; the only files this deletes are ones nothing else will.
-    rm -f "$OUT"/signal.rank*.h5
+    # Clear THIS ADAPTER's shards from any earlier run before launching. The merge globs
+    # and trusts what it finds, so a previous run at a different rank count leaves orphans
+    # the glob picks up. Scoped to $ADAPTER: the shard names carry the adapter precisely
+    # so two adapters sharing an OUT cannot collide, and a blanket rm would undo that.
+    rm -f "$OUT"/signal."$ADAPTER".rank*.h5
 
     mpirun python -m ampcal.run \
         --adapter "$ADAPTER" --which signal --out "$OUT/signal.h5" \
@@ -98,7 +136,7 @@ else
     # Merge is serial and cheap -- one process, no mpirun. It names any shard it cannot
     # read rather than dying on an opaque h5py traceback; `--allow-partial` is the
     # deliberate override, never the default.
-    python -m ampcal.merge --out "$OUT/signal.h5" "$OUT"/signal.rank*.h5
+    python -m ampcal.merge --out "$OUT/signal.h5" "$OUT"/signal."$ADAPTER".rank*.h5
 fi
 
 python -m ampcal.reduce.calibrate \

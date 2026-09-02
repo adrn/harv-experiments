@@ -73,11 +73,20 @@ def _estimate_cost(cell: Cell) -> float:
     return 5.3 + 0.107 * cell.n_obs
 
 
-def _rank_path(out: Path, rank: int, size: int) -> Path:
-    """This rank's output path. Unsuffixed when there is only one rank."""
+def _rank_path(out: Path, adapter: str, rank: int, size: int) -> Path:
+    """This rank's output path. Unsuffixed when there is only one rank.
+
+    **The adapter is in the filename, not only in the directory.** ``OUT`` defaults to
+    ``output/<adapter>/``, but it is an override point, and pointing two adapters at one
+    directory made both runs write ``signal.rank000.h5`` -- same rank count, same names.
+    The result was not a clean overwrite but shards with one run's link heap and the
+    other's object headers: names that list fine and objects that will not open, on every
+    shard, with a 60 core-hour grid behind them. Putting the adapter here makes that
+    collision impossible rather than merely detectable.
+    """
     if size <= 1:
         return out
-    return out.with_name(f"{out.stem}.rank{rank:03d}{out.suffix}")
+    return out.with_name(f"{out.stem}.{adapter}.rank{rank:03d}{out.suffix}")
 
 
 def run_one(
@@ -281,11 +290,11 @@ def main(argv: list[str] | None = None) -> int:
             arms=f"{len(arms)} arms"
                  + (f" + reference n_mc={args.reference_n_mc}"
                     if args.reference_n_mc else ""),
-            output=_rank_path(args.out, rank, size).name,
+            output=_rank_path(args.out, adapter.name, rank, size).name,
         )
 
     started = time.perf_counter()
-    out_path = _rank_path(args.out, rank, size)
+    out_path = _rank_path(args.out, adapter.name, rank, size)
     every = args.progress_every if args.progress_every is not None else 50
     n_failed = 0
 
@@ -368,7 +377,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  FAILED       : {failed:,} simulations -- see the rank logs")
     if size > 1:
         print(f"  next         : python -m ampcal.merge --out {args.out} "
-              f"{args.out.with_suffix('')}.rank*{args.out.suffix}")
+              f"{args.out.with_suffix('')}.{adapter.name}.rank*{args.out.suffix}")
     return 1 if failed else 0
 
 

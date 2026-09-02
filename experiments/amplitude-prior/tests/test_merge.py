@@ -322,3 +322,53 @@ def test_space_preflight_refuses_before_writing(
         shards, tmp_path / "signal.h5", check_space=False, **NO_WAIT
     )
     assert n_sims == 12
+
+
+def test_shallow_check_misses_what_deep_catches(tmp_path: Path) -> None:
+    """The bug this cost us: listing link names proves the names are readable and
+    nothing else, so a shard whose object headers are unopenable passes a shallow check
+    and then fails the merge with `Unable to open object (message not aligned)`.
+    """
+    import ampcal.merge as m
+
+    p = _shard(tmp_path / "signal.rank000.h5", ["a_seed000", "b_seed001"])
+    # Give the shard the structure the deep pass walks.
+    with h5py.File(p, "a") as h:
+        for sid in h["sims"]:
+            h["sims"][sid].create_group("arms").create_group("H1_e+0.0000_s1")
+
+    real_getitem = h5py.Group.__getitem__
+
+    def broken_headers(self, key):
+        # The merge opens sim groups by path off the File ("sims/<id>"), so matching on
+        # the key is what catches it; matching on self.name would not.
+        if isinstance(key, str) and key.startswith("sims/"):
+            raise KeyError("Unable to open object (message not aligned)")
+        return real_getitem(self, key)
+
+    h5py.Group.__getitem__ = broken_headers
+    try:
+        shallow = m.inspect_shards([p], deep=False, attempts=1)[0]
+        deep = m.inspect_shards([p], deep=True, attempts=1)[0]
+    finally:
+        h5py.Group.__getitem__ = real_getitem
+
+    assert shallow.ok, "shallow pass should still see the link names"
+    assert not deep.ok, "deep pass must open the headers and fail"
+    assert "message not aligned" in deep.error
+
+
+def test_mixing_adapters_is_refused(tmp_path: Path) -> None:
+    """The failure that cost the RV grid: OUT was exported, so a Gaia run wrote its
+    shards into the RV directory under the same rank filenames. Names alone gave it
+    away only because n_obs=64 does not exist in the RV grid -- the tool should say so
+    directly."""
+    import ampcal.merge as m
+
+    a = _shard(tmp_path / "signal.rank000.h5", ["physical_pr0.1_snr3_e0_n32_seed000"])
+    b = _shard(tmp_path / "signal.rank001.h5", ["physical_pr0.1_snr3_e0_n64_seed000"])
+    with h5py.File(b, "a") as h:
+        h.attrs["adapter"] = "gaia"
+    with pytest.raises(ValueError, match="Two runs shared an output directory"):
+        m.merge([a, b], tmp_path / "signal.h5", **NO_WAIT)
+    assert not (tmp_path / "signal.h5").exists()

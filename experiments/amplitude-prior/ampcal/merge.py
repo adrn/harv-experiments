@@ -18,7 +18,10 @@ an opaque ``h5py`` traceback that names no file is useless at 2am, so every shar
 opened defensively, failures are collected with the file that caused them, and
 ``--allow-partial`` merges what is good after saying exactly what it dropped.
 
-``--check`` does the same inspection and writes nothing:
+``--check`` inspects and writes nothing. It is **deep** by default -- it opens every
+simulation's object header, not just the ``/sims`` link names -- because a shallow pass
+once reported "576 shards, 0 bad" on shards that then failed the copy with an
+object-header error::
 
     python -m ampcal.merge --check output/rv/signal.rank*.h5
 """
@@ -147,29 +150,54 @@ class ShardReport:
         )
 
 
+def _read_shard(path: Path, *, deep: bool) -> int:
+    """Number of simulations in ``path``, exercising what the merge will need.
+
+    Shallow walks the ``/sims`` link names. That is enough to catch an unreadable link
+    heap, and it is what the merge's own ``for sim_id in src["sims"]`` does first.
+
+    Deep additionally *opens* every simulation's object header, its attributes and its
+    ``arms`` subgroup. This distinction is not academic: a shallow pass reported "576
+    shards, 0 bad" on a set of shards that then failed during the copy with
+    ``Unable to open object (message not aligned)`` -- an object-header error, on
+    headers a shallow pass never touches. Listing names proves the names are readable
+    and nothing else.
+
+    Deep still does not read dataset *contents*; only ``merge`` does that, which is why
+    the copy loop keeps its own guard.
+    """
+    with h5py.File(path, "r") as src:
+        sim_ids = list(src["sims"])
+        if deep:
+            for sim_id in sim_ids:
+                group = src[f"sims/{sim_id}"]
+                dict(group.attrs)
+                list(group["arms"])
+        return len(sim_ids)
+
+
 def inspect_shards(
     inputs: list[Path],
     *,
+    deep: bool = False,
     attempts: int | None = None,
     delay: float | None = None,
 ) -> list[ShardReport]:
     """Open every shard and report what it holds, without writing anything.
 
-    ``mtime`` is reported because it is the discriminator between the two failure
-    modes: a shard from *this* run clusters with its siblings, while one left over from
-    an earlier run with a different rank count is visibly older -- and an orphan of a
+    ``mtime`` is reported because it is the discriminator between two failure modes: a
+    shard from *this* run clusters with its siblings, while one left over from an
+    earlier run with a different rank count is visibly older -- and an orphan of a
     killed run is exactly the kind of file that is truncated.
 
-    The link names are **iterated**, not counted. ``len(group)`` reads the group's
-    stored object count and need not touch the link heap, so a file whose heap block is
-    unreadable passes a length check and then fails in the merge's own
-    ``for sim_id in src["sims"]`` -- which is precisely the observed failure
-    (``unable to offset into local heap data block``). The check has to perform the same
-    operation the merge does or it is not a check.
+    ``deep`` decides how much of each shard is proved readable; see :func:`_read_shard`.
+    It defaults to ``False`` for :func:`merge`'s preflight, which only needs to reject
+    obviously-broken files cheaply before writing anything -- the copy loop reports and
+    rolls back anything that fails later. ``--check`` defaults it to ``True``, because a
+    post-mortem exists to find the damage rather than to be quick.
 
-    Each shard is retried (see :func:`_with_retry`) because that observed failure turned
-    out to be transient: every one of the 576 shards read perfectly minutes later. Pass
-    ``attempts=1`` to inspect without waiting, which is what a post-mortem wants.
+    Each shard is retried (see :func:`_with_retry`), since one observed failure turned
+    out to be transient. Pass ``attempts=1`` to inspect without waiting.
     """
     # Resolved here rather than bound as defaults: a default argument is evaluated once
     # at import, so `RETRY_ATTEMPTS` would document a policy this function had already
@@ -183,8 +211,7 @@ def inspect_shards(
         mtime = _mtime(stat)
 
         def read(p: Path = path) -> int:
-            with h5py.File(p, "r") as src:
-                return len(list(src["sims"]))
+            return _read_shard(p, deep=deep)
 
         try:
             n = _with_retry(read, attempts=attempts, delay=delay)
@@ -279,6 +306,19 @@ def merge(
                             out.create_dataset("frequency", data=grid)
                             for k, v in src.attrs.items():
                                 out.attrs[k] = v
+                        elif src.attrs.get("adapter") != out.attrs.get("adapter"):
+                            # Checked before the grid, because it is the same mistake
+                            # with a far better message. Two adapters were pointed at
+                            # one OUT and wrote each other's shards; the grids differ
+                            # too (RV 1828 frequencies, Gaia 914), so the grid check
+                            # would catch it, but only as an unexplained mismatch.
+                            raise ValueError(
+                                f"{path} was written by adapter "
+                                f"{src.attrs.get('adapter')!r} but {usable[0]} by "
+                                f"{out.attrs.get('adapter')!r}. Two runs shared an "
+                                "output directory. Their grids and cells are not "
+                                "comparable; re-run with a separate OUT per adapter."
+                            )
                         elif grid.shape != reference_grid.shape or not np.allclose(
                             grid, reference_grid, rtol=0, atol=0
                         ):
@@ -362,6 +402,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="output artifact; required unless --check")
     parser.add_argument("--check", action="store_true",
                         help="inspect the shards and report; write nothing")
+    parser.add_argument("--shallow", action="store_true",
+                        help="with --check, only list link names instead of opening "
+                             "every simulation's object header. Faster, and strictly "
+                             "weaker: a shallow pass passes shards whose headers the "
+                             "merge then cannot open")
     parser.add_argument("--no-space-check", action="store_true",
                         help="skip the free-space preflight")
     parser.add_argument("--allow-partial", action="store_true",
@@ -372,8 +417,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         # One attempt: --check is a post-mortem, and its job is to report what is true
-        # right now rather than to wait out a transient the way the merge should.
-        reports = inspect_shards(args.inputs, attempts=1)
+        # right now rather than to wait out a transient the way the merge should. Deep
+        # by default: a check that skips what the merge does is not a check.
+        reports = inspect_shards(args.inputs, deep=not args.shallow, attempts=1)
         print(_summarize(reports))
         return 1 if any(not r.ok for r in reports) else 0
 
