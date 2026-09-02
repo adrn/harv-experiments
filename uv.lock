@@ -316,7 +316,6 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "harv" },
-    { name = "kepmodel" },
     { name = "matplotlib" },
     { name = "pandas" },
     { name = "tabulate" },
@@ -339,7 +338,6 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "harv", git = "https://github.com/adrn/harv.git?rev=periodogram" },
-    { name = "kepmodel", git = "https://gitlab.unige.ch/delisle/kepmodel.git" },
     { name = "matplotlib", specifier = ">=3.11.1" },
     { name = "mpi4py", marker = "extra == 'mpi'", specifier = ">=4.1.2" },
     { name = "pandas", specifier = ">=3.0.5" },
@@ -459,26 +457,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/91/c1/091b8852bd7cbf50bd655543c8506033cf4029300c67f8c176c1286879a9/jaxtyping-0.3.11.tar.gz", hash = "sha256:b09c14acf6686feb9e0df5b0d8c6e7c5b6f8d36bf059ee54cd522a186c2ef050", size = 46489, upload-time = "2026-06-13T18:35:23.167Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8b/38/c66bbdc5047f4776c2bd3e47e5295a350e3fa44d5b8942105e71c2a876a0/jaxtyping-0.3.11-py3-none-any.whl", hash = "sha256:8a4bedc4e3f963fa82df41bd13c7ebc2bad925601eb48614c65798f21329d4e3", size = 56593, upload-time = "2026-06-13T18:35:22.01Z" },
-]
-
-[[package]]
-name = "kepderiv"
-version = "1.0.9"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/9d/79/c0617abfdc52e014508e09dabe36c9e0026a2767e980bb73604c602d28a2/kepderiv-1.0.9.tar.gz", hash = "sha256:60ffd114077814014d895efd7f266c5a1628b1cff2fa4908df8dba63005fb795", size = 21302, upload-time = "2025-08-25T08:31:17.783Z" }
-
-[[package]]
-name = "kepmodel"
-version = "1.0.9"
-source = { git = "https://gitlab.unige.ch/delisle/kepmodel.git#b00349721d8443ecb146d9ae69b573ce1f4dcc1a" }
-dependencies = [
-    { name = "kepderiv" },
-    { name = "numpy" },
-    { name = "scipy" },
-    { name = "spleaf" },
 ]
 
 [[package]]
@@ -1356,16 +1334,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
 ]
-
-[[package]]
-name = "spleaf"
-version = "2.1.17"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy" },
-    { name = "scipy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/36/ed/b434231de67cc68a008f5daf8b88f6f8d7dce37ac191183bd7dbd7902550/spleaf-2.1.17.tar.gz", hash = "sha256:23059ca8d75b1069db20e8911eb8adb0dd1885da2913627d26f779163a1de99d", size = 52373, upload-time = "2025-08-22T23:11:01.746Z" }
 
 [[package]]
 name = "tabulate"

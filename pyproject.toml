@@ -5,7 +5,6 @@ license = { file = "LICENSE" }
 requires-python = ">=3.12"
 dependencies = [
     "harv",
-    "kepmodel",
     "matplotlib>=3.11.1",
     "pandas>=3.0.5",
     "tabulate>=0.10.0",
@@ -48,4 +47,3 @@ default-groups = ["dev"]
 
 [tool.uv.sources]
 harv = { git = "https://github.com/adrn/harv.git", rev = "periodogram" }
-kepmodel = { git = "https://gitlab.unige.ch/delisle/kepmodel.git" }
